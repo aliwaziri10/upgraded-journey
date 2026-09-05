@@ -74,12 +74,22 @@ timeout so a run always exits cleanly rather than getting killed
 mid-shot). This does not change per-shot logic, retry behavior, or the
 resumable one-shot-of-progress-per-save pattern at all - only wraps it
 in a loop instead of running it once per process invocation.
+
+FIX 1 + FIX 2 (2026-09-06): ported prompt-safety guards from Marius -
+QUALITY_GUARD (waxy/plastic AI skin) and CROWD_ANATOMY_SAFETY_GUARD
+(cloned/identical crowd faces), see video/prompt_guards.py for the guard
+text and rationale. Previously this file sent Gemini's raw
+scene_description/visual_description straight to Agnes with no safety
+guard text appended at all - both guards are now appended to every
+shot's prompt in render_one_shot(), right before submission.
 """
 import json
 import os
 import time
 import urllib.request
 import urllib.error
+
+from prompt_guards import QUALITY_GUARD, CROWD_ANATOMY_SAFETY_GUARD
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
@@ -357,6 +367,12 @@ def render_one_shot():
     shot = shot_list[next_index]
     prompt = shot.get("scene_description") or shot.get("visual_description", "")
     prompt = prompt.strip()
+    # FIX 1 + FIX 2 (2026-09-06): append prompt-safety guards ported from
+    # Marius - skin-realism (waxy/plastic AI skin) and crowd-anatomy
+    # (cloned/identical crowd faces). Previously Gemini's raw
+    # scene_description/visual_description went straight to Agnes with
+    # no safety guard text at all.
+    prompt = f"{prompt}, {QUALITY_GUARD}, {CROWD_ANATOMY_SAFETY_GUARD}"
     duration = shot_durations[next_index]
 
     print(f"Row {row_id}: rendering shot {next_index + 1}/{total_shots} (~{duration:.1f}s): {prompt[:80]!r}")
