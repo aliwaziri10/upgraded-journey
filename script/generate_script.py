@@ -1,38 +1,18 @@
 """
-TechPulse - Script Stage (LONG-FORM)
-Rewritten 2026-08-04 for the move away from 30-40s Shorts toward long-form
-videos matching Erased/Alternate Earth's format.
+ClipStorm (formerly TechPulse) - Script Stage (LONG-FORM)
 
-SCHEMA FIX (2026-08-05): the 2026-08-04 version of this file wrote
-status='shots_pending', narration_full, and a separate video_shots table
-with scene_description rows - but narration/generate_narration.py (also
-rewritten 2026-08-04, ported directly from Marius) actually expects
-status='scripted', row["script"], and a single shot_list JSON array
-living directly on the video_pipeline row, each entry carrying its own
-narration_excerpt. pipeline.yml's gate query already checks for
-status in ('scripted','narrated','video_complete') - that was the real
-intended design all along. This version conforms to it instead of
-building a second, incompatible schema alongside it.
+PIVOT (2026-09-10): PROMPT_TEMPLATE rewritten for true-crime/unsolved-
+mystery documentary narration instead of tech/AI news, per Zia's decision
+to pivot this channel to ClipStorm. Everything else in this file
+(call_gemini retry/backoff logic, Supabase insert, JSON schema) is
+UNCHANGED from the previous version - narration/generate_narration.py,
+video/generate_video.py, assembly/assemble.py, and publish/youtube_upload.py
+all consume the same {"narration", "has_recurring_person", "shots"} shape
+regardless of content, so this stage is a prompt swap, not a schema change.
 
-Each shot now carries BOTH a narration_excerpt (the exact slice of the
-narration it covers, used by generate_narration.py to compute accurate
-per-shot audio timing) and a visual_description (the actual Agnes video
-prompt). The two are asked for together so the excerpts, concatenated in
-order, reconstruct the full narration - required for narration.py's
-sentence/word-overlap timing algorithm to line up correctly.
-
-RETRY FIX (2026-08-09): call_gemini() previously made exactly one attempt -
-any transient 429/5xx/network hiccup silently killed that headline's only
-script slot for the whole 5-minute pipeline cycle, with no record of why.
-Ported the same retry-with-backoff pattern already proven in Marius's
-script_writing.py: up to 4 attempts, 15/30/45s backoff, retryable on
-429/500/502/503/504 and on network errors. Unlike Marius, there is no
-persistent topic-tracking table here (headlines come fresh from
-research/latest_headlines.json each run and generate_scripts() already
-moves on to the next headline on failure), so no blacklist-status logic
-was ported - it would have nothing to attach to. Failure reasons are now
-printed with the same detail Marius logs, so they show up in the Action
-run output.
+Cases are sourced by research/sources.py from Wikipedia (public record) -
+the "title"/"summary"/"link" fields it produces map directly into this
+prompt in place of the old headline/summary pair.
 """
 import json
 import os
@@ -57,29 +37,30 @@ TARGET_SHOT_COUNT = 45           # roughly one shot per 8-9 seconds of narration
 MAX_RETRIES = 4
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-PROMPT_TEMPLATE = """You are writing a long-form YouTube video (6-7 minutes) for a tech/AI/science news channel. Your job is to hold attention for the full length with a documentary-style narrative, not a quick hook-and-CTA format.
-Headline: {title}
-Summary: {summary}
+PROMPT_TEMPLATE = """You are writing a long-form YouTube true-crime documentary video (6-7 minutes) about a real, well-documented unsolved or cold case. Your job is to hold attention for the full length with a tense, atmospheric documentary-style narrative, not a quick hook-and-CTA format.
+Case: {title}
+Background (public record, from Wikipedia): {summary}
 
 Write THREE separate things:
 
-1. NARRATION: A full {word_count} word documentary-style spoken script covering this story in depth - background/context, what happened, why it matters, and implications/what's next. Structure it in clear sections (open with a strong hook, build through the story's key developments, close with a considered takeaway) but write it as continuous flowing narration, not headers or bullet points.
-   NEVER OUTPUT CODE: even if the story is about programming, software, or a technical tool, the narration must ONLY ever be plain spoken English describing what happened and why it matters - never literal code, syntax, command-line text, file paths, variable names, or function calls read as if spoken aloud. Describe technical concepts in plain language a general audience would understand, never quote source material verbatim if it contains code or markup.
+1. NARRATION: A full {word_count} word documentary-style spoken script covering this case in depth - the setting and victims/people involved, the timeline of what happened, the investigation and its dead ends, the leading theories, and why the case remains unsolved or unresolved to this day. Structure it with a strong cold-open hook (a striking detail or the moment the case begins), build through the investigation's key developments and twists, and close with the case's current status and its lasting mystery. Write it as continuous flowing narration, not headers or bullet points.
+   STAY STRICTLY FACTUAL: use ONLY details present in the background text above or widely and reliably documented public facts about this specific case. NEVER invent a name, date, confession, forensic detail, or theory that isn't real - fabricated specifics in true crime content are both misleading and a legal liability. If a detail is genuinely unknown or disputed, say so explicitly ("investigators were never able to determine...") rather than inventing an answer.
+   NEVER accuse or name any living, unconvicted person as the perpetrator - refer to unidentified or unconvicted suspects only by whatever public designation is already used (e.g. "the Zodiac," "an unidentified male," a police-assigned label), never assert guilt as fact.
 
-2. HAS_RECURRING_PERSON: true only if the headline/summary is actually about a specific, named individual whose face or actions are central to the story. false for abstract, statistical, institutional, or trend-based stories.
+2. HAS_RECURRING_PERSON: true only if the case centers on one specific, named victim or figure whose identity is central and appropriate to depict (e.g. a named victim). false if the case is about a location, an unidentified body, or an event without one clear central figure.
 
 3. SHOTS: An array of exactly {shot_count} shot objects, in order, that TOGETHER cover the entire narration from start to finish with no gaps and no overlaps. Each shot object has exactly two fields:
    - "narration_excerpt": the exact, word-for-word slice of the NARRATION text (from field 1) that plays during this shot. Copy this text verbatim from the narration you wrote - do not paraphrase it. Concatenating every shot's narration_excerpt in order must reconstruct the full narration exactly.
-   - "visual_description": a short cinematic scene description for an AI video generator covering camera angle, lighting, and setting for this moment. Vary the shots (don't repeat the same framing back to back).
+   - "visual_description": a short cinematic scene description for an AI video generator / archival-footage search, covering camera angle, lighting, and setting for this moment. Vary the shots (don't repeat the same framing back to back).
 
-CRITICAL consistency rules for visual_description - the video generator has NO memory between shots, so every visual_description must be fully self-contained:
-- Pick ONE real-world setting (country/city/company/location) strictly from what the headline and summary actually describe. Do not invent or drift to an unrelated location, and do not add institutions, uniforms, flags, or military/national symbols that are not actually part of the story.
-- If HAS_RECURRING_PERSON is true: invent ONE fixed physical description the first time (approximate age, gender, one or two distinguishing features) and repeat that EXACT description word-for-word in every shot they appear in. Never let age, gender, or appearance drift between shots.
-- If HAS_RECURRING_PERSON is false: do NOT invent any person at all. Build every shot from setting, objects, data visualizations, cityscapes, office/lab/exterior shots, screens, documents, charts - whatever fits the story. A generic unnamed person may appear at most incidentally, never as a repeating anchor.
+CRITICAL consistency and tone rules for visual_description:
+- Favor atmospheric, tasteful visuals appropriate to true crime: period-accurate settings, streets, houses, documents, evidence photos/maps/newspaper clippings, investigators reviewing files, foggy/night exteriors, archival-style footage. NEVER depict graphic violence, gore, or an explicit crime-in-progress - suggest tension and unease through atmosphere and setting, not graphic content.
+- Pick ONE real-world setting (the actual city/region where the case took place) strictly from what the background text describes. Do not invent or drift to an unrelated location.
+- If HAS_RECURRING_PERSON is true: invent ONE fixed physical description consistent with any real details given (approximate age, general appearance) the first time, and repeat that EXACT description word-for-word in every shot they appear in. Never let age, gender, or appearance drift between shots. Depict them respectfully, never in a violent or graphic pose.
+- If HAS_RECURRING_PERSON is false: do NOT invent any central person. Build every shot from setting, evidence objects, maps, documents, archival photos, exteriors of real buildings/streets - whatever fits the case.
 - ZOOM DISCIPLINE: at most 1-in-4 shots may be push_in/crash_zoom/extreme_close_up. At least 1-in-4 shots must be wide/establishing. Never place two zoom-in-family shots back to back.
-- Avoid close-up shots of hands operating small precise objects (dials, switches, buttons, keyboards) - AI video generators render fine hand-object interaction unreliably. Favor wider shots instead.
-- Every shot must be clearly, brightly lit (natural daylight or bright interior lighting) and state this explicitly, UNLESS the story specifically requires darkness or nighttime - in which case say so explicitly instead.
-- No anachronisms: only include objects/technology that plausibly belong to the actual time period and setting of the story.
+- Lighting should support mood - dim/overcast/nighttime is appropriate and expected for true crime atmosphere, but state the lighting explicitly in each shot so it's consistent.
+- No anachronisms: only include objects/technology/clothing that plausibly belong to the actual time period and setting of the case.
 
 Output strict JSON only, no other text:
 {{"narration": "...", "has_recurring_person": true, "shots": [{{"narration_excerpt": "...", "visual_description": "..."}}]}}"""
