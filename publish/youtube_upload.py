@@ -31,8 +31,18 @@ Titles are now truncated to 100 characters at the last whole word before
 being sent to YouTube - the full original headline is unaffected anywhere
 else (Supabase title column, narration, etc.), only what's sent to the
 YouTube API is shortened.
+
+STORAGE CLEANUP (2026-09-10): once a row is confirmed published (mark_published
+has succeeded), its source video file no longer needs to sit in Supabase
+Storage. delete_video_from_storage() parses the bucket/object path out of
+the row's own video_url and issues a Storage API delete - best-effort,
+never raises, same non-fatal contract as every other cleanup step in this
+pipeline. Placed after mark_published so a cleanup failure can never be
+mistaken for a publish failure (the row already reflects reality by the
+time this could fail).
 """
 import os
+import re
 from datetime import datetime, timezone
 
 import requests
@@ -57,6 +67,11 @@ TMP_DIR = "publish/tmp"
 
 RETRY_LIMIT = 3
 YOUTUBE_TITLE_MAX_CHARS = 100
+
+# Matches both public and signed Supabase Storage object URLs, e.g.
+# https://<project>.supabase.co/storage/v1/object/public/<bucket>/<path>
+# https://<project>.supabase.co/storage/v1/object/sign/<bucket>/<path>?token=...
+STORAGE_URL_PATTERN = re.compile(r"/storage/v1/object/(?:public|sign|authenticated)/([^/]+)/([^?]+)")
 
 
 def get_next_video_generated_row():
@@ -92,6 +107,34 @@ def download(url, out_path):
     resp.raise_for_status()
     with open(out_path, "wb") as f:
         f.write(resp.content)
+
+
+def delete_video_from_storage(video_url):
+    """STORAGE CLEANUP (2026-09-10): parses the bucket + object path out of
+    a Supabase Storage URL and deletes it via the Storage REST API. Never
+    raises - a failed cleanup should never affect publish status, which is
+    already recorded in Supabase by the time this runs. Silently no-ops if
+    video_url isn't a recognizable Supabase Storage URL (e.g. already
+    migrated to a different host)."""
+    if not video_url:
+        return
+    match = STORAGE_URL_PATTERN.search(video_url)
+    if not match:
+        print(f"  Storage cleanup skipped: could not parse a Supabase Storage bucket/path from {video_url}")
+        return
+    bucket, object_path = match.group(1), match.group(2)
+    try:
+        resp = requests.delete(
+            f"{SUPABASE_URL}/storage/v1/object/{bucket}/{object_path}",
+            headers=HEADERS,
+            timeout=30,
+        )
+        if resp.status_code >= 400 and resp.status_code != 404:
+            print(f"  WARNING: storage cleanup failed for {bucket}/{object_path} ({resp.status_code}): {resp.text[:300]}")
+        else:
+            print(f"  Deleted source video from Supabase Storage: {bucket}/{object_path}")
+    except requests.RequestException as e:
+        print(f"  WARNING: storage cleanup failed for {bucket}/{object_path} (network error): {e}")
 
 
 def get_youtube_client():
@@ -183,6 +226,10 @@ def main():
         print(f"Uploaded: {title} -> {youtube_video_id}")
 
         mark_published(row_id, youtube_video_id)
+
+        # STORAGE CLEANUP (2026-09-10): only runs after mark_published, and
+        # never raises - see delete_video_from_storage's docstring.
+        delete_video_from_storage(video_url)
 
     except Exception as e:
         print(f"ERROR publishing '{title}' (row {row_id}): {e}")
