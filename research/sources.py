@@ -1,23 +1,28 @@
 """
-ClipStorm (formerly TechPulse) - Research Stage
-PIVOT (2026-09-10): switched from tech/AI RSS headlines to true-crime /
-unsolved-mystery case research, per Zia's decision to pivot this channel
-to ClipStorm. Downstream stages (script/narration/video/assembly/publish)
-are untouched - they only care about the {title, link, source, summary}
-shape this stage produces, which is preserved exactly, so this is a
-content-source swap, not a schema change.
+Vera Lane Finance (formerly ClipStorm/TechPulse) - Research Stage
 
-Cases come from a curated seed list of well-documented unsolved/cold
-cases (public record, safe to narrate - no ongoing live investigation
-sensitivities, no naming of unconvicted living suspects). For each case,
-this stage fetches its Wikipedia summary via Wikipedia's public REST API
-(no key required) to use as the "summary" field the script stage expands
-into a full narration - same role _clean_summary'd RSS text used to play
-before.
+PIVOT (2026-09-10): switched from true-crime cases to personal-finance /
+credit-card-optimization explainer topics, per Zia's decision to pivot
+this channel again - modeled on Graham Stephan's format (concrete
+number/headline hook, data-driven walkthrough, clear takeaway) but for a
+fixed AI host persona (Vera Lane) rather than a real person. Downstream
+stages are untouched - same {title, link, source, summary} shape as
+every prior version of this file, so this is a third content-source
+swap on the same schema, not a new pipeline.
+
+Topics come from a curated seed list of well-documented, factual personal
+finance / credit mechanics subjects (how compound interest works, how
+credit utilization affects your score, how balance transfers work, etc.)
+- deliberately mechanics/explainer topics, NOT specific card or stock
+recommendations, to stay in "financial education" territory rather than
+"financial advice" (see PROMPT_TEMPLATE in generate_script.py for the
+same constraint applied to the actual script). Each topic's Wikipedia
+summary is fetched the same way the true-crime version fetched case
+summaries, and used as factual grounding for the script stage.
 
 Same dedup logic as before: checks Supabase video_pipeline for an
 existing row with the same link (canonical Wikipedia URL) or exact title
-before selecting a case, so the same case is never produced twice.
+before selecting a topic, so the same topic is never produced twice.
 """
 import json
 import os
@@ -32,31 +37,30 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 WIKIPEDIA_SUMMARY_API = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 MAX_SUMMARY_CHARS = 900
 
-# Curated seed list of well-documented, public-record unsolved/cold true
-# crime cases - safe to narrate (no naming of unconvicted living suspects,
-# no active/sensitive ongoing investigations). Wikipedia page titles,
-# exactly as they appear in the URL.
-CASE_SEED_LIST = [
-    "Zodiac_Killer",
-    "Tamam_Shud_case",
-    "Hinterkaifeck_murders",
-    "Murder_of_Elizabeth_Short",
-    "Disappearance_of_the_Beaumont_children",
-    "Isdal_Woman",
-    "Watcher_(Cairo,_Illinois)",
-    "Boy_in_the_Box",
-    "Murder_of_JonBenét_Ramsey",
-    "Disappearance_of_Maura_Murray",
-    "Springfield_Three",
-    "Death_of_Elisa_Lam",
-    "Villisca_axe_murders",
-    "Lead_Masks_Case",
-    "Somerton_Man",
-    "Circleville_letters",
-    "Axeman_of_New_Orleans",
-    "Zodiac_Killer_ciphers",
-    "Disappearance_of_D._B._Cooper",
-    "Servant_Girl_Annihilator",
+# Curated seed list of factual personal-finance / credit mechanics topics -
+# explainer subjects, not specific product/stock recommendations. Wikipedia
+# page titles, exactly as they appear in the URL.
+TOPIC_SEED_LIST = [
+    "Compound_interest",
+    "Credit_score",
+    "Credit_card",
+    "Annual_percentage_rate",
+    "Balance_transfer",
+    "Roth_IRA",
+    "401(k)",
+    "Emergency_fund",
+    "Debt_avalanche_method",
+    "Debt_snowball_method",
+    "Credit_utilization_ratio",
+    "High-yield_savings_account",
+    "Index_fund",
+    "Fixed-rate_mortgage",
+    "Adjustable-rate_mortgage",
+    "Tax_bracket",
+    "FICO_score",
+    "Credit_card_rewards_program",
+    "Cash_back",
+    "Sinking_fund_(finance)",
 ]
 
 
@@ -89,7 +93,7 @@ def _query_supabase_exists(filter_clause):
         return False
 
 
-def _case_already_processed(link, title):
+def _topic_already_processed(link, title):
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         print("Warning: SUPABASE_URL/SUPABASE_ANON_KEY not set - skipping duplicate check.")
         return False
@@ -106,7 +110,7 @@ def _case_already_processed(link, title):
 
 def _fetch_wikipedia_summary(page_title):
     url = WIKIPEDIA_SUMMARY_API + urllib.parse.quote(page_title)
-    req = urllib.request.Request(url, headers={"User-Agent": "ClipStorm-Research/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "VeraLaneFinance-Research/1.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read())
     display_title = data.get("title", page_title.replace("_", " "))
@@ -116,13 +120,12 @@ def _fetch_wikipedia_summary(page_title):
     return display_title, extract, canonical_url
 
 
-def fetch_case_candidates():
-    """Fetches Wikipedia summaries for every case in the seed list. A case
-    whose Wikipedia fetch fails (renamed page, network hiccup) is skipped
-    for this run - future runs will retry it since the seed list itself
-    doesn't track failures."""
+def fetch_topic_candidates():
+    """Fetches Wikipedia summaries for every topic in the seed list. A
+    topic whose Wikipedia fetch fails (renamed page, network hiccup) is
+    skipped for this run - future runs will retry it."""
     results = []
-    for page_title in CASE_SEED_LIST:
+    for page_title in TOPIC_SEED_LIST:
         try:
             display_title, extract, canonical_url = _fetch_wikipedia_summary(page_title)
         except Exception as e:
@@ -132,7 +135,7 @@ def fetch_case_candidates():
             print(f"Skipping {page_title!r} - empty extract from Wikipedia.")
             continue
         results.append({
-            "source": "wikipedia_true_crime",
+            "source": "wikipedia_personal_finance",
             "title": display_title,
             "summary": extract,
             "link": canonical_url,
@@ -143,30 +146,29 @@ def fetch_case_candidates():
 
 
 def select_top_headline(candidates):
-    """Pick the first case in seed-list order that hasn't already been
-    processed. (Seed list order acts as priority; unlike the RSS version
-    there's no publish-date freshness signal to sort by.)"""
+    """Pick the first topic in seed-list order that hasn't already been
+    processed."""
     if not candidates:
         return []
     for candidate in candidates:
         link = candidate.get("link", "")
         title = candidate.get("title", "")
-        if _case_already_processed(link, title):
-            print(f"Skipping already-processed case: {title}")
+        if _topic_already_processed(link, title):
+            print(f"Skipping already-processed topic: {title}")
             continue
         return [candidate]
-    print("All candidate cases this run were already processed - nothing new to publish. "
-          "Add more titles to CASE_SEED_LIST to keep the pipeline fed.")
+    print("All candidate topics this run were already processed - nothing new to publish. "
+          "Add more titles to TOPIC_SEED_LIST to keep the pipeline fed.")
     return []
 
 
 def save_headlines(headlines, path="research/latest_headlines.json"):
     with open(path, "w") as f:
         json.dump(headlines, f, indent=2)
-    print(f"Saved {len(headlines)} case(s) to {path}")
+    print(f"Saved {len(headlines)} topic(s) to {path}")
 
 
 if __name__ == "__main__":
-    all_candidates = fetch_case_candidates()
+    all_candidates = fetch_topic_candidates()
     selected = select_top_headline(all_candidates)
     save_headlines(selected)
