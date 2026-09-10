@@ -1,87 +1,75 @@
 """
-TechPulse - Research Stage
-Pulls trending tech / AI / science headlines from free RSS feeds.
-Selects the most recent headline that hasn't already been processed
-(checked against the Supabase video_pipeline table).
-No API key required for RSS; Supabase credentials are optional but
-recommended to avoid re-publishing the same story.
+ClipStorm (formerly TechPulse) - Research Stage
+PIVOT (2026-09-10): switched from tech/AI RSS headlines to true-crime /
+unsolved-mystery case research, per Zia's decision to pivot this channel
+to ClipStorm. Downstream stages (script/narration/video/assembly/publish)
+are untouched - they only care about the {title, link, source, summary}
+shape this stage produces, which is preserved exactly, so this is a
+content-source swap, not a schema change.
 
-FIXED (2026-08-04): RSS summaries were passed to the script stage as raw,
-unsanitized text. Some feeds (TechCrunch, Ars Technica, etc.) embed HTML,
-<code>/<pre> blocks, or literal code snippets inside the summary excerpt
-for programming-related stories. That raw text was going straight into the
-Gemini prompt, and Gemini would sometimes quote the code verbatim into the
-narration - which the TTS stage then read aloud word-for-word, producing
-a video where the narrator reads Python syntax mid-story. Now every
-summary is HTML-stripped, code-block-stripped, and length-capped before
-it's saved, so nothing but plain prose ever reaches the script stage.
+Cases come from a curated seed list of well-documented unsolved/cold
+cases (public record, safe to narrate - no ongoing live investigation
+sensitivities, no naming of unconvicted living suspects). For each case,
+this stage fetches its Wikipedia summary via Wikipedia's public REST API
+(no key required) to use as the "summary" field the script stage expands
+into a full narration - same role _clean_summary'd RSS text used to play
+before.
 
-FIXED (2026-08-06): duplicate-check bypass. The dedup check only ran
-inside `if link and _link_already_processed(link)` - if an RSS entry's
-link ever came back empty (some feeds omit it, or feedparser returns ""
-on a malformed entry), the whole check was skipped and that headline was
-free to be picked again on a future run with zero protection, producing
-a repeat video with a different id. Now every candidate is checked -
-by link when one exists, falling back to an exact title match against
-already-processed rows when it doesn't - so an empty link can no longer
-silently disable dedup.
+Same dedup logic as before: checks Supabase video_pipeline for an
+existing row with the same link (canonical Wikipedia URL) or exact title
+before selecting a case, so the same case is never produced twice.
 """
-import feedparser
 import json
 import os
 import re
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-
-# Free, no-key-required RSS feeds covering tech / AI / science
-FEEDS = {
-    "techcrunch": "https://techcrunch.com/feed/",
-    "verge": "https://www.theverge.com/rss/index.xml",
-    "arstechnica": "https://feeds.arstechnica.com/arstechnica/index",
-    "mit_tech_review": "https://www.technologyreview.com/feed/",
-    "science_daily": "https://www.sciencedaily.com/rss/top/technology.xml",
-}
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 
-# Matches <pre>...</pre> and <code>...</code> blocks (code snippets embedded
-# in the RSS excerpt), including multi-line content, before the general tag strip.
-CODE_BLOCK_RE = re.compile(r"<(pre|code)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
-HTML_TAG_RE = re.compile(r"<[^>]+>")
-MAX_SUMMARY_CHARS = 600
+WIKIPEDIA_SUMMARY_API = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+MAX_SUMMARY_CHARS = 900
+
+# Curated seed list of well-documented, public-record unsolved/cold true
+# crime cases - safe to narrate (no naming of unconvicted living suspects,
+# no active/sensitive ongoing investigations). Wikipedia page titles,
+# exactly as they appear in the URL.
+CASE_SEED_LIST = [
+    "Zodiac_Killer",
+    "Tamam_Shud_case",
+    "Hinterkaifeck_murders",
+    "Murder_of_Elizabeth_Short",
+    "Disappearance_of_the_Beaumont_children",
+    "Isdal_Woman",
+    "Watcher_(Cairo,_Illinois)",
+    "Boy_in_the_Box",
+    "Murder_of_JonBenét_Ramsey",
+    "Disappearance_of_Maura_Murray",
+    "Springfield_Three",
+    "Death_of_Elisa_Lam",
+    "Villisca_axe_murders",
+    "Lead_Masks_Case",
+    "Somerton_Man",
+    "Circleville_letters",
+    "Axeman_of_New_Orleans",
+    "Zodiac_Killer_ciphers",
+    "Disappearance_of_D._B._Cooper",
+    "Servant_Girl_Annihilator",
+]
 
 
-def _clean_summary(raw_summary):
-    """Strips embedded code blocks, then all remaining HTML tags, collapses
-    whitespace, and caps length - so only plain prose reaches the script stage."""
-    if not raw_summary:
+def _clean_extract(raw_extract):
+    if not raw_extract:
         return ""
-    text = CODE_BLOCK_RE.sub(" ", raw_summary)
-    text = HTML_TAG_RE.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", raw_extract).strip()
     if len(text) > MAX_SUMMARY_CHARS:
         text = text[:MAX_SUMMARY_CHARS].rsplit(" ", 1)[0] + "..."
     return text
 
 
-def _parse_date(entry):
-    """Best-effort parse of an entry's published date. Falls back to epoch (UTC) if missing/bad."""
-    raw = entry.get("published", "")
-    try:
-        dt = parsedate_to_datetime(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return datetime.min.replace(tzinfo=timezone.utc)
-
-
 def _query_supabase_exists(filter_clause):
-    """Runs a single exists-check query against video_pipeline. filter_clause is
-    a raw PostgREST filter string, e.g. 'link=eq.foo' or 'title=eq.bar'."""
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         return False
     url = f"{SUPABASE_URL}/rest/v1/video_pipeline?{filter_clause}&select=id"
@@ -101,12 +89,9 @@ def _query_supabase_exists(filter_clause):
         return False
 
 
-def _headline_already_processed(link, title):
-    """Check whether this headline has already been processed. Prefers an
-    exact link match; if link is missing/empty, falls back to an exact title
-    match so a blank link can never silently bypass dedup entirely."""
+def _case_already_processed(link, title):
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        print("Warning: SUPABASE_URL/SUPABASE_ANON_KEY not set in this stage - skipping duplicate check.")
+        print("Warning: SUPABASE_URL/SUPABASE_ANON_KEY not set - skipping duplicate check.")
         return False
     if link:
         encoded_link = urllib.parse.quote(link, safe="")
@@ -119,49 +104,69 @@ def _headline_already_processed(link, title):
     return False
 
 
-def fetch_headlines(limit_per_source=5):
-    """Fetch latest headlines from all sources."""
+def _fetch_wikipedia_summary(page_title):
+    url = WIKIPEDIA_SUMMARY_API + urllib.parse.quote(page_title)
+    req = urllib.request.Request(url, headers={"User-Agent": "ClipStorm-Research/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    display_title = data.get("title", page_title.replace("_", " "))
+    extract = _clean_extract(data.get("extract", ""))
+    canonical_url = data.get("content_urls", {}).get("desktop", {}).get("page",
+                        f"https://en.wikipedia.org/wiki/{urllib.parse.quote(page_title)}")
+    return display_title, extract, canonical_url
+
+
+def fetch_case_candidates():
+    """Fetches Wikipedia summaries for every case in the seed list. A case
+    whose Wikipedia fetch fails (renamed page, network hiccup) is skipped
+    for this run - future runs will retry it since the seed list itself
+    doesn't track failures."""
     results = []
-    for source_name, url in FEEDS.items():
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:limit_per_source]:
-            results.append({
-                "source": source_name,
-                "title": entry.get("title", ""),
-                "summary": _clean_summary(entry.get("summary", "")),
-                "link": entry.get("link", ""),
-                "published": entry.get("published", ""),
-                "fetched_at": datetime.utcnow().isoformat(),
-                "_sort_date": _parse_date(entry),
-            })
+    for page_title in CASE_SEED_LIST:
+        try:
+            display_title, extract, canonical_url = _fetch_wikipedia_summary(page_title)
+        except Exception as e:
+            print(f"Skipping {page_title!r} this run - Wikipedia fetch failed: {e}")
+            continue
+        if not extract:
+            print(f"Skipping {page_title!r} - empty extract from Wikipedia.")
+            continue
+        results.append({
+            "source": "wikipedia_true_crime",
+            "title": display_title,
+            "summary": extract,
+            "link": canonical_url,
+            "published": "",
+            "fetched_at": datetime.utcnow().isoformat(),
+        })
     return results
 
 
-def select_top_headline(headlines):
-    """Pick the most recent headline that hasn't already been processed."""
-    if not headlines:
+def select_top_headline(candidates):
+    """Pick the first case in seed-list order that hasn't already been
+    processed. (Seed list order acts as priority; unlike the RSS version
+    there's no publish-date freshness signal to sort by.)"""
+    if not candidates:
         return []
-    ranked = sorted(headlines, key=lambda h: h["_sort_date"], reverse=True)
-    for candidate in ranked:
+    for candidate in candidates:
         link = candidate.get("link", "")
         title = candidate.get("title", "")
-        if _headline_already_processed(link, title):
-            print(f"Skipping already-processed headline: {title}")
+        if _case_already_processed(link, title):
+            print(f"Skipping already-processed case: {title}")
             continue
-        candidate.pop("_sort_date", None)
         return [candidate]
-    print("All candidate headlines this run were already processed — nothing new to publish.")
+    print("All candidate cases this run were already processed - nothing new to publish. "
+          "Add more titles to CASE_SEED_LIST to keep the pipeline fed.")
     return []
 
 
 def save_headlines(headlines, path="research/latest_headlines.json"):
-    """Save selected headline(s) to a JSON file."""
     with open(path, "w") as f:
         json.dump(headlines, f, indent=2)
-    print(f"Saved {len(headlines)} headline(s) to {path}")
+    print(f"Saved {len(headlines)} case(s) to {path}")
 
 
 if __name__ == "__main__":
-    all_headlines = fetch_headlines()
-    selected = select_top_headline(all_headlines)
+    all_candidates = fetch_case_candidates()
+    selected = select_top_headline(all_candidates)
     save_headlines(selected)
